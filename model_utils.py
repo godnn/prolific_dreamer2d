@@ -252,7 +252,7 @@ def sds_vsd_grad_diffuser(unet, noisy_latents, noise, text_embeddings, t, unet_p
 
     if generation_mode == 'sds':
         # SDS
-        grad = grad_scale * (noise_pred - noise)
+        grad = grad_scale * (noise_pred - noise) # 模型预测噪声和目标噪声之间的差异
         # grad = grad_scale * (noise_pred)  # SJC
         noise_pred_phi = noise
     elif generation_mode == 'vsd':
@@ -349,28 +349,49 @@ def get_optimizer(parameters, config):
     return optimizer
 
 
-def get_latents(particles, vae, rgb_as_latents=False, use_mlp_particle=False):
+def get_latents(particles, vae, rgb_as_latents=False, use_mlp_particle=False, calculate_vae_encoder_gap=False):
     ### get latents from particles
     if use_mlp_particle:
-        images = []
-        output_size = 64 if rgb_as_latents else 512
-        # Loop over all MLPs and generate an image for each
-        for particle_mlp in particles:
-            image = particle_mlp.generate_image(output_size)
-            images.append(image)
-        # Stack all images together
-        latents = torch.cat(images, dim=0)
+        images_2 = []
+        if calculate_vae_encoder_gap:
+            output_size = 64
+            for particle_mlp in particles:
+                image = particle_mlp.generate_image(output_size) # 64 就是latent， 512就是image
+                images_2.append(image)
+            # Stack all images together
+            latents = torch.cat(images_2, dim=0)
+            decode_image = batch_decode_vae(latents, vae)
+            images_2 = [decode_image]
+
+        else:
+            output_size = 64 if rgb_as_latents else 512
+            # Loop over all MLPs and generate an image for each
+            for particle_mlp in particles:
+                image = particle_mlp.generate_image(output_size)
+                images_2.append(image)
+            # Stack all images together
+            latents = torch.cat(images_2, dim=0)
+            
+            # from torchvision.utils import save_image
+            # save_image((image).clamp(0, 1), f'latents_output_size.png')
+        
         if not rgb_as_latents:
             latents = vae.config.scaling_factor * vae.encode(latents).latent_dist.sample()
+
     else:
+        images_2 = []
         if rgb_as_latents:
-            latents = F.interpolate(particles, (64, 64), mode="bilinear", align_corners=False)
+            latents = F.interpolate(particles, (64, 64), mode="bilinear", align_corners=False) # 通过 get_latents 函数进行处理，以便得到适合输入扩散模型（UNet）的潜在表示。
+            images_2.append(latents)
         else:
             rgb_BCHW_512 = F.interpolate(particles, (512, 512), mode="bilinear", align_corners=False)
+            # rgb_BCHW_512 = particles
             # encode image into latents with vae
             latents = vae.config.scaling_factor * vae.encode(rgb_BCHW_512).latent_dist.sample()
-    return latents
-
+            from torchvision.utils import save_image
+            save_image((rgb_BCHW_512).clamp(0, 1), f'rgb_BCHW_512.png')
+            images_2.append(rgb_BCHW_512)
+    return latents, images_2
 
 @torch.no_grad()
 def batch_decode_vae(latents, vae):
@@ -470,14 +491,226 @@ class Siren(nn.Module):
         output = self.net(coords)
         return output #, coords
     
-    def generate_image(self, img_size=64):
+    def generate_image(self, img_size=64): 
+        '''
+        使用praticles mlp 从空白的64*64网络生成 一个 64*64 latent
+        '''
         # Generate an input grid coordinates in a range of -1 to 1.
         grid = torch.Tensor([[[2*(x / (img_size - 1)) - 1, 2*(y / (img_size - 1)) - 1] for y in range(img_size)] for x in range(img_size)])
         grid = grid.view(-1, 2)  # Reshape to (img_size*img_size, 2)
         grid = grid.to(self.device)
         rgb_values = self.forward(grid)
-        rgb_values = torch.tanh(rgb_values)     # [-1, 1]
+        
+        rgb_values = torch.tanh(rgb_values)     # [-1, 1] # rgb_values.shape = torch.Size([262144, 3])
         # Reshape to an image
-        rgb_values = rgb_values.view(1, img_size, img_size, self.out_features)
+        rgb_values = rgb_values.view(1, img_size, img_size, self.out_features) # rgb_values.shape = torch.Size([1, 512, 512, 3])
+        
+        rgb_temp = rgb_values.permute(0, 3, 1, 2) # rgb_temp.shape = torch.Size([1, 3, 512, 512])
+        
+        # from torchvision.utils import save_image
+        # save_image(rgb_temp, f'debug/rgb_values.png')
+        
         image = rgb_values.permute(0, 3, 1, 2)
         return image
+
+from pytorch_msssim import ssim as ssim_1, ms_ssim
+import os
+class loss_tracker():
+    def __init__(self, device, gt, resolution=(512, 512)):
+        import lpips
+        self.lpips_model = lpips.LPIPS(net='alex').to(device)
+        
+        self.gt_image = gt
+        self.image_resolution = resolution
+        self.totalloss_list = []
+        self.sdsloss_list = []
+        self.mse_list = []
+        self.psnr_list = []
+        self.lpips_list = []
+        self.ssim_list = []
+        self.msssim_list = []
+        self.vae_encoder_gap_list = []
+        
+    def append_loss(self, sds_loss, totalloss, pred, mse_loss_=None, ssim_loss_=None, vae_encoder_gap_loss=None):
+        # sdsloss
+        self.sdsloss_list.append(sds_loss.clone().detach().cpu().numpy())
+        # mseloss
+        mse = torch.nn.functional.mse_loss(pred, self.gt_image) # 计算psnr时也需要
+        self.mse_list.append(mse.clone().detach().cpu().numpy())
+        # psnr
+        max_pixel = 1.0  # 假设张量已经归一化到 [0, 1] 范围
+        psnr = 10 * torch.log10(max_pixel ** 2 / mse)
+        self.psnr_list.append(psnr.clone().detach().cpu().numpy())
+        height, width = self.image_resolution
+        model_out = pred.view(1, 3, height, width)
+        gt_img = self.gt_image.view(1, 3, height, width)
+        # 计算 LPIPS
+        lpips_value = self.lpips_model(model_out, gt_img)
+        self.lpips_list.append(lpips_value[0, 0, 0, 0].clone().detach().cpu().numpy())
+        # 计算 SSIM
+        ssim = ssim_1(pred.unsqueeze(0), self.gt_image.unsqueeze(0), data_range=1, size_average=True)
+        self.ssim_list.append(ssim.clone().detach().cpu().numpy())
+        # 计算 MS-SSIM
+        ms_ssim_value = ms_ssim(model_out, gt_img, data_range=1, size_average=False)
+        self.msssim_list.append(ms_ssim_value.clone().detach().cpu().numpy())
+        # total_loss
+        self.totalloss_list.append(totalloss.clone().detach().cpu().numpy())
+        # vae_encoder_gap_loss
+        if vae_encoder_gap_loss is not None:
+            self.vae_encoder_gap_list.append(vae_encoder_gap_loss.clone().detach().cpu().numpy())
+    
+    def save_loss(self, save_path):
+        os.makedirs(save_path, exist_ok=True) 
+        
+        epochs = range(1, len(self.totalloss_list) + 1)
+        # 绘制 totalloss
+        plt.figure(figsize=(10, 6))
+        plt.plot(epochs, self.totalloss_list, label='Loss')
+        plt.title('Loss over Epochs')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.legend()
+        plt.savefig(os.path.join(save_path, 'loss_plot.png'))  # 替换为您的路径
+        plt.close()
+        for i in range(len(self.totalloss_list)):
+            with open(os.path.join(save_path, 'loss_list.txt'), "a") as file:
+                file.write(f'{self.totalloss_list[i]}\n')
+        with open(os.path.join(save_path, 'loss_list.txt'), "a") as file:
+                file.write(f'loss的最小值为: {min(self.totalloss_list)}\n')
+
+        # 绘制 mse
+        plt.figure(figsize=(10, 6))
+        plt.plot(epochs, self.mse_list, label='MSE')
+        plt.title('MSE over Epochs')
+        plt.xlabel('Epoch')
+        plt.ylabel('MSE')
+        plt.legend()
+        plt.savefig(os.path.join(save_path, 'mse_plot.png'))  # 替换为您的路径
+        plt.close()
+        for i in range(len(self.mse_list)):
+            with open(os.path.join(save_path, 'mse_list.txt'), "a") as file:
+                file.write(f'{self.mse_list[i]}\n')
+        with open(os.path.join(save_path, 'mse_list.txt'), "a") as file:
+                file.write(f'mse的最小值为: {min(self.mse_list)}\n')
+
+        # 绘制 ssim
+        plt.figure(figsize=(10, 6))
+        plt.plot(epochs, self.ssim_list, label='SSIM')
+        plt.title('SSIM over Epochs')
+        plt.xlabel('Epoch')
+        plt.ylabel('SSIM')
+        plt.legend()
+        plt.savefig(os.path.join(save_path, 'ssim_plot.png')) # 替换为您的路径
+        plt.close()
+        for i in range(len(self.ssim_list)):
+            with open(os.path.join(save_path, 'ssim_list.txt'), "a") as file:
+                file.write(f'{self.ssim_list[i]}\n')
+        with open(os.path.join(save_path, 'ssim_list.txt'), "a") as file:
+                file.write(f'ssim的最大值为: {max(self.ssim_list)}\n')
+
+        # 绘制 ms-ssim
+        plt.figure(figsize=(10, 6))
+        plt.plot(epochs, self.ssim_list, label='MS-SSIM')
+        plt.title('MS-SSIM over Epochs')
+        plt.xlabel('Epoch')
+        plt.ylabel('MS-SSIM')
+        plt.legend()
+        plt.savefig(os.path.join(save_path, 'msssim_plot.png')) # 替换为您的路径
+        plt.close()
+        for i in range(len(self.msssim_list)):
+            with open(os.path.join(save_path, 'msssim_list.txt'), "a") as file:
+                file.write(f'{self.msssim_list[i]}\n')
+        with open(os.path.join(save_path, 'msssim_list.txt'), "a") as file:
+                file.write(f'msssim的最大值为: {max(self.msssim_list)}\n')
+                
+        # 绘制 lpips
+        plt.figure(figsize=(10, 6))
+        plt.plot(epochs, self.ssim_list, label='LPIPS')
+        plt.title('LPIPS over Epochs')
+        plt.xlabel('Epoch')
+        plt.ylabel('LPIPS')
+        plt.legend()
+        plt.savefig(os.path.join(save_path, 'lpips_plot.png')) # 替换为您的路径
+        plt.close()
+        for i in range(len(self.lpips_list)):
+            with open(os.path.join(save_path, 'lpips_list.txt'), "a") as file:
+                file.write(f'{self.lpips_list[i]}\n')
+        with open(os.path.join(save_path, 'lpips_list.txt'), "a") as file:
+                file.write(f'lpips的最小值为: {min(self.lpips_list)}\n')
+
+        # 绘制 psnr
+        plt.figure(figsize=(10, 6))
+        plt.plot(epochs, self.psnr_list, label='PSNR')
+        plt.title('PSNR over Epochs')
+        plt.xlabel('Epoch')
+        plt.ylabel('PSNR')
+        plt.legend()
+        plt.savefig(os.path.join(save_path, 'psnr_plot.png'))  # 替换为您的路径
+        plt.close()
+        for i in range(len(self.psnr_list)):
+            with open(os.path.join(save_path, 'psnr_list.txt'), "a") as file:
+                file.write(f'{self.psnr_list[i]}\n')
+        with open(os.path.join(save_path, 'psnr_list.txt'), "a") as file:
+                file.write(f'psnr的最大值为: {max(self.psnr_list)}\n')
+                
+        # 绘制 vae_encoder_gap_list
+        plt.figure(figsize=(10, 6))
+        plt.plot(epochs, self.vae_encoder_gap_list, label='vae_encoder_gap')
+        plt.title('vae_encoder_gap over Epochs')
+        plt.xlabel('Epoch')
+        plt.ylabel('vae_encoder_gap')
+        plt.legend()
+        plt.savefig(os.path.join(save_path, 'vae_encoder_gap_list.png'))  # 替换为您的路径
+        plt.close()
+        for i in range(len(self.vae_encoder_gap_list)):
+            with open(os.path.join(save_path, 'vae_encoder_gap_list.txt'), "a") as file:
+                file.write(f'{self.vae_encoder_gap_list[i]}\n')
+
+        # 绘制 sdsloss_list
+        plt.figure(figsize=(10, 6))
+        plt.plot(epochs, self.sdsloss_list, label='sdsloss')
+        plt.title('sdsloss over Epochs')
+        plt.xlabel('Epoch')
+        plt.ylabel('sdsloss_list')
+        plt.legend()
+        plt.savefig(os.path.join(save_path, 'sdsloss_list.png'))  # 替换为您的路径
+        plt.close()
+        for i in range(len(self.sdsloss_list)):
+            with open(os.path.join(save_path, 'sdsloss_list.txt'), "a") as file:
+                file.write(f'{self.sdsloss_list[i]}\n')
+                
+        print(f'total_loss的最小值为: {min(self.totalloss_list)}, psnr的最大值为: {max(self.psnr_list)}, lpips的最小值为: {min(self.lpips_list)}, ssim的最大值为: {max(self.ssim_list)}, msssim的最大值为: {max(self.msssim_list)} \n')
+        
+        
+def packback_get_latents(particles, vae, rgb_as_latents=False, use_mlp_particle=False, calculate_vae_encoder_gap=False):
+    ### get latents from particles
+    if use_mlp_particle:
+        images = []
+        output_size = 64 if rgb_as_latents else 512
+        # Loop over all MLPs and generate an image for each
+        for particle_mlp in particles:
+            image = particle_mlp.generate_image(output_size)
+            images.append(image)
+        # Stack all images together
+        latents = torch.cat(images, dim=0)
+        
+        from torchvision.utils import save_image
+        save_image((image).clamp(0, 1), f'latents_output_size.png')
+        
+        if not rgb_as_latents:
+            latents = vae.config.scaling_factor * vae.encode(latents).latent_dist.sample()
+
+    else:
+        images = []
+        if rgb_as_latents:
+            latents = F.interpolate(particles, (64, 64), mode="bilinear", align_corners=False) # 通过 get_latents 函数进行处理，以便得到适合输入扩散模型（UNet）的潜在表示。
+            images.append(latents)
+        else:
+            # rgb_BCHW_512 = F.interpolate(particles, (512, 512), mode="bilinear", align_corners=False)
+            rgb_BCHW_512 = particles
+            # encode image into latents with vae
+            latents = vae.config.scaling_factor * vae.encode(rgb_BCHW_512).latent_dist.sample()
+            from torchvision.utils import save_image
+            save_image((rgb_BCHW_512).clamp(0, 1), f'rgb_BCHW_512.png')
+            images.append(rgb_BCHW_512)
+    return latents, images

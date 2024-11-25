@@ -1,0 +1,24 @@
+num_steps 500
+log_steps 50 
+lr 0.0001
+use_mlp_particle true
+phi_lr 0.0001
+use_t_phi true 
+model_path stabilityai/stable-diffusion-2-1-base
+loss_weight 1m_alphas_cumprod
+t_schedule random 
+generation_mode sds
+height 512 
+width 512 
+batch_size 1 
+guidance_scale 7.5
+log_progress true 
+save_x0 true
+work_dir work_dir/1121/sd2.1/sds/loadBadWeights/prompt/mixloss
+load_weight_path weight_prepare/humberger1000/best_model_15.pt
+rgb_as_latents false
+use_mseloss true
+mseloss_weight 0.5
+use_ssimloss true
+ssimloss_weight 0.1
+prompt A hamberger on a wooden table with buildings in the background

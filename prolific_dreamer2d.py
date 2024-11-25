@@ -35,6 +35,9 @@ transformers_logging.set_verbosity_error()  # disable warning
 
 from diffusers import AutoencoderKL, UNet2DConditionModel
 from diffusers import DDIMScheduler
+from diffusers import UNet2DModel, VQModel
+
+from model_utils import batch_decode_vae
 
 IMG_EXTENSIONS = ['jpg', 'png', 'jpeg', 'bmp']
 
@@ -50,17 +53,33 @@ def get_parser(**parser_kwargs):
             raise argparse.ArgumentTypeError("Boolean value expected.")
 
     parser = argparse.ArgumentParser(**parser_kwargs)
+    
+    def parse_args_from_file(file_path):
+        args = {}
+        with open(file_path, 'r') as f:
+            for line in f:
+                # 去掉空白符和注释
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    # 以空格分割key和value
+                    key_value = line.split(maxsplit=1)
+                    if len(key_value) == 2:
+                        # 将参数存储到字典中
+                        args[key_value[0]] = key_value[1]
+        # 将字典转换为Namespace对象
+        return argparse.Namespace(**args)
+    
     # parameters
     ### basics
     parser.add_argument('--seed', default=1024, type=int, help='global seed')
     parser.add_argument('--log_steps', type=int, default=50, help='Log steps')
     parser.add_argument('--log_progress', type=str2bool, default=False, help='Log progress')
     parser.add_argument('--log_gif', type=str2bool, default=False, help='Log gif')
-    parser.add_argument('--model_path', type=str, default='CompVis/stable-diffusion-v1-4', help='Path to the model')
+    parser.add_argument('--model_path', type=str, default='CompVis/stable-diffusion-v1-4', help='Path to the model') # stabilityai/stable-diffusion-2-1-base
     current_datetime = datetime.now()
     parser.add_argument('--run_date', type=str, default=current_datetime.strftime("%Y%m%d"), help='Run date')
     parser.add_argument('--run_time', type=str, default=current_datetime.strftime("%H%M"), help='Run time')
-    parser.add_argument('--work_dir', type=str, default='work_dir/prolific_dreamer2d', help='Working directory')
+    parser.add_argument('--work_dir', type=str, default='work_dir/1111/test', help='Working directory')
     parser.add_argument('--half_inference', type=str2bool, default=False, help='inference sd with half precision')
     parser.add_argument('--save_x0', type=str2bool, default=False, help='save predicted x0')
     parser.add_argument('--save_phi_model', type=str2bool, default=False, help='save save_phi_model, lora or simple unet')
@@ -73,7 +92,7 @@ def get_parser(**parser_kwargs):
     parser.add_argument('--t_start', type=int, default=20, help='least possible timestep for random sampling')
     parser.add_argument('--multisteps', default=1, type=int, help='multisteps to predict x0')
     parser.add_argument('--t_schedule', default='descend', type=str, help='t_schedule for sampling')
-    parser.add_argument('--prompt', default="a photograph of an astronaut riding a horse", type=str, help='prompt')
+    parser.add_argument('--prompt', default="", type=str, help='prompt') # a photograph of an astronaut riding a horse
     parser.add_argument('--n_prompt', default="", type=str, help='negative prompt')
     parser.add_argument('--height', default=512, type=int, help='height of image')
     parser.add_argument('--width', default=512, type=int, help='width of image')
@@ -101,6 +120,22 @@ def get_parser(**parser_kwargs):
     parser.add_argument('--loss_weight_type', type=str, default='none', help='type of loss weight')
     parser.add_argument('--nerf_init', type=str2bool, default=False, help='initialize with diffusion models as mean predictor')
     parser.add_argument('--grad_scale', type=float, default=1., help='grad_scale for loss in vsd')
+    
+    parser.add_argument('--load_weight_path', type=str, default='', help='path of prepared weight')
+    parser.add_argument('--use_mseloss', type=str2bool, default=False, help='use_mseloss')
+    parser.add_argument('--mseloss_weight', type=float, default=0.5, help='grad_scale for loss in vsd')
+    parser.add_argument('--use_ssimloss', type=str2bool, default=False, help='use_ssimloss')
+    parser.add_argument('--ssimloss_weight', type=float, default=0.5, help='grad_scale for loss in vsd')
+    parser.add_argument('--gt_img_path', type=str, default='', help='Path to the gt') # weight_prepare/humberger1000/hamburger_rgb.png
+    parser.add_argument('--calculate_vae_encoder_gap', type=str2bool, default=False, help='calculate_vae_encoder_gap')
+
+    # 从文件读取的参数
+    file_args = parse_args_from_file('args.txt')
+
+    # 将从文件读取的参数添加到ArgumentParser
+    for key, value in vars(file_args).items():
+        parser.set_defaults(**{key: value})
+    
     args = parser.parse_args()
     # create working directory
     args.run_id = args.run_date + '_' + args.run_time
@@ -121,11 +156,10 @@ def get_parser(**parser_kwargs):
     ### set random seed everywhere
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(args.seed)
-        torch.cuda.manual_seed_all(args.seed)  # for multi-GPU.
+        torch.cuda.manual_seed_all(args.seed)  # for multi-GPU
     np.random.seed(args.seed)  # Numpy module.
     random.seed(args.seed)  # Python random module.
-    torch.manual_seed(args.seed)
+    
     return args
 
 
@@ -141,7 +175,7 @@ def main():
     #                                config & logger                                #
     #################################################################################
     args = get_parser()
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
     dtype = torch.float32 # use float32 by default
     image_name = args.prompt.replace(' ', '_')
     shutil.copyfile(__file__, join(args.work_dir, os.path.basename(__file__)))
@@ -163,11 +197,12 @@ def main():
     logger.info("################# Arguments: ####################")
     for arg in vars(args):
         logger.info(f"\t{arg}: {getattr(args, arg)}")
-    
+
     #################################################################################
     #                         load model & diffusion scheduler                      #
     #################################################################################
     logger.info(f'load models from path: {args.model_path}')
+        
     # 1. Load the autoencoder model which will be used to decode the latents into image space. 
     vae = AutoencoderKL.from_pretrained(args.model_path, subfolder="vae", torch_dtype=dtype)
     # 2. Load the tokenizer and text encoder to tokenize and encode the text. 
@@ -255,21 +290,33 @@ def main():
     with torch.no_grad():
         text_embeddings = text_encoder(text_input.input_ids.to(device))[0]
     max_length = text_input.input_ids.shape[-1]
-    uncond_input = tokenizer(
+    uncond_input = tokenizer( # 是一个包含消极提示词的文本条件（张量）
         [args.n_prompt] * max(args.particle_num_vsd,args.particle_num_phi), padding="max_length", max_length=max_length, return_tensors="pt"
     )
     with torch.no_grad():
         uncond_embeddings = text_encoder(uncond_input.input_ids.to(device))[0]
     text_embeddings_vsd = torch.cat([uncond_embeddings[:args.particle_num_vsd], text_embeddings[:args.particle_num_vsd]])
     text_embeddings_phi = torch.cat([uncond_embeddings[:args.particle_num_phi], text_embeddings[:args.particle_num_phi]])
-    ### init particles
-    if args.use_mlp_particle:
+    ### init particles # 默认并不开启
+    if args.use_mlp_particle: 
         # use siren network
         from model_utils import Siren
         args.lr = 1e-4
         print(f'for mlp_particle, set lr to {args.lr}')
+        print(f'prompt = {args.prompt}, cfg = {args.guidance_scale}')
         out_features = 4 if args.rgb_as_latents else 3
         particles = nn.ModuleList([Siren(2, hidden_features=256, hidden_layers=3, out_features=out_features, device=device) for _ in range(args.batch_size)])
+        if args.load_weight_path and args.load_weight_path != '':
+            particles.load_state_dict(torch.load(args.load_weight_path))
+            particles = particles.to(device, dtype=dtype)
+            ### 生成一张初始图像 original_weight_images
+            original_weight_images = []
+            # Loop over all MLPs and generate an image for each
+            for particle_mlp in particles:
+                original_weight_image = particle_mlp.generate_image(512)
+                original_weight_images.append(original_weight_image)
+            # Stack all images together
+            original_weight_images = torch.cat(original_weight_images, dim=0).detach()
     else:
         if args.init_img_path:
             # load image
@@ -280,8 +327,9 @@ def main():
             else:
                 particles = init_image.to(device)
         else:
-            if args.rgb_as_latents:
-                particles = torch.randn((args.batch_size, unet.config.in_channels, args.height // 8, args.width // 8))
+            if args.rgb_as_latents: # # 默认 true
+                # 在扩散模型的推理阶段，particles 作为一个初始的潜在空间表示，并在逐步迭代的过程中被去噪，逐渐逼近目标图像的潜在表示。
+                particles = torch.randn((args.batch_size, unet.config.in_channels, args.height // 8, args.width // 8)) # particles.shape = torch.Size([1, 4, 64, 64])
             else:
                 # gaussian in rgb space --> strange artifacts
                 particles = torch.randn((args.batch_size, 3, args.height, args.width))
@@ -290,7 +338,7 @@ def main():
                 # particles = torch.randn((args.batch_size, unet.in_channels, args.height // 8, args.width // 8)).to(device, dtype=dtype)
                 # particles = vae.decode(particles).sample
     particles = particles.to(device, dtype=dtype)
-    if args.nerf_init and args.rgb_as_latents and not args.use_mlp_particle:
+    if args.nerf_init and args.rgb_as_latents and not args.use_mlp_particle: # 无效 因为默认args.nerf_init=False
         # current only support sds and experimental for only rgb_as_latents==True
         assert args.generation_mode == 'sds'
         with torch.no_grad():
@@ -303,7 +351,7 @@ def main():
     ### weight loss
     loss_weights = get_loss_weights(scheduler.betas, args)
     ### optimizer
-    if args.use_mlp_particle:
+    if args.use_mlp_particle: # 默认 false
         # For a list of models, we want to optimize their parameters
         particles_to_optimize = [param for mlp in particles for param in mlp.parameters() if param.requires_grad]
     else:
@@ -314,11 +362,11 @@ def main():
     total_parameters = sum(p.numel() for p in particles_to_optimize if p.requires_grad)
     print(f'Total number of trainable parameters in particles: {total_parameters}; number of particles: {args.batch_size}')
     ### Initialize optimizer & scheduler
-    if args.generation_mode == 'vsd':
+    if args.generation_mode == 'vsd': # vsd
         if args.phi_model in ['lora', 'unet_simple']:
             phi_optimizer = torch.optim.AdamW([{"params": phi_params, "lr": args.phi_lr}], lr=args.phi_lr)
             print(f'number of trainable parameters of phi model in optimizer: {sum(p.numel() for p in phi_params if p.requires_grad)}')
-    optimizer = get_optimizer(particles_to_optimize, args)
+    optimizer = get_optimizer(particles_to_optimize, args) # sds
     ### lr_scheduler
     if args.use_scheduler:
         lr_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, \
@@ -334,74 +382,48 @@ def main():
     ave_train_loss_values = []
     if args.log_progress:
         image_progress = []
+        image_2_progress = []
     first_iteration = True
     logger.info("################# Metrics: ####################")
     ######## t schedule #########
     chosen_ts = get_t_schedule(num_train_timesteps, args, loss_weights)
     pbar = tqdm(chosen_ts)
+    
+    from torchvision import transforms
+    # 真实图像
+    gt_img = imageio.imread(f"{args.gt_img_path}")
+    gt_img = transforms.ToTensor()(gt_img).float().to(device, dtype).unsqueeze(0)
+    # gt_img.shape = torch.Size([1, 3, 512, 512])
+    
+    # 自定义loss记录
+    from model_utils import loss_tracker
+    lossTracker = None
+    # if args.load_weight_path and args.load_weight_path != '':
+    lossTracker = loss_tracker(device, gt_img) 
+    
     #################################################################################
-    #                                     MODE: T2I                                 #
+    #                                     MODE: T2I      DELETED                            #
     #################################################################################
-    ### regular sd text to image generation
-    if args.generation_mode == 't2i':
-        if args.phi_model == 'lora' and args.load_phi_model_path:
-            ### unet_phi is the same instance as unet that has been modified in-place
-            unet_phi, unet_lora_layers = extract_lora_diffusers(unet, device)
-            phi_params = list(unet_lora_layers.parameters())
-            unet_phi.load_attn_procs(args.load_phi_model_path)
-            unet = unet_phi.to(device)
-        step = 0
-        # get latent of all particles
-        assert args.use_mlp_particle == False
-        latents = get_latents(particles, vae, args.rgb_as_latents)
-        if args.half_inference:
-            latents = latents.half()
-            text_embeddings_vsd = text_embeddings_vsd.half()
-        for t in tqdm(scheduler.timesteps):
-            # expand the latents if we are doing classifier-free guidance to avoid doing two forward passes.
-            latent_model_input = torch.cat([latents] * 2)
-            latent_model_input = scheduler.scale_model_input(latent_model_input, t)
-            latent_noisy = latents
-            # predict the noise residual
-            with torch.no_grad():
-                noise_pred = unet(latent_model_input, t, encoder_hidden_states=text_embeddings_vsd).sample
-            # perform guidance
-            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-            noise_pred = noise_pred_uncond + args.guidance_scale * (noise_pred_text - noise_pred_uncond)
-            # compute the previous noisy sample x_t -> x_t-1
-            latents = scheduler.step(noise_pred, t, latents).prev_sample
-            ######## Evaluation and log metric #########
-            if args.log_steps and (step % args.log_steps == 0 or step == (args.num_steps-1)):
-                # save current img_tensor
-                # scale and decode the image latents with vae
-                tmp_latents = 1 / vae.config.scaling_factor * latents.clone().detach()
-                if args.save_x0:
-                    # compute the predicted clean sample x_0
-                    pred_latents = scheduler.step(noise_pred, t, latent_noisy).pred_original_sample.to(dtype).clone().detach()
-                with torch.no_grad():
-                    if args.half_inference:
-                        tmp_latents = tmp_latents.half()
-                    image_ = vae.decode(tmp_latents).sample.to(torch.float32)
-                    if args.save_x0:
-                        if args.half_inference:
-                            pred_latents = pred_latents.half()
-                        image_x0 = vae.decode(pred_latents / vae.config.scaling_factor).sample.to(torch.float32)
-                        image = torch.cat((image_,image_x0), dim=2)
-                    else:
-                        image = image_
-                if args.log_progress:
-                    image_progress.append((image/2+0.5).clamp(0, 1))
-            step += 1
+    ### regular sd text to image generation 
+    # if args.generation_mode == 't2i':
+    #     if args.phi_model == 'lora' and args.load_phi_model_path:
+ 
 
     #################################################################################
     #                                 MODE: SDS | VSD                               #
     #################################################################################
     ### sds text to image generation
-    elif args.generation_mode in ['sds', 'vsd']:
+    pre_image = None
+    if args.generation_mode in ['sds', 'vsd']:
         cross_attention_kwargs = {'scale': args.lora_scale} if (args.generation_mode == 'vsd' and args.phi_model == 'lora') else {}
         for step, chosen_t in enumerate(pbar):
             # get latent of all particles
-            latents = get_latents(particles, vae, args.rgb_as_latents, use_mlp_particle=args.use_mlp_particle)
+            
+            if not args.rgb_as_latents and not args.use_mlp_particle:
+                save_image((particles/2+0.5).clamp(0, 1), f'{args.work_dir}/{image_name}_particles.png')
+                
+            latents, images = get_latents(particles, vae, args.rgb_as_latents, use_mlp_particle=args.use_mlp_particle, calculate_vae_encoder_gap=args.calculate_vae_encoder_gap) # particles 转化为 latents
+            
             t = torch.tensor([chosen_t]).to(device)
             ######## q sample #########
             # random sample particle_num_vsd particles from latents
@@ -422,13 +444,47 @@ def main():
                                                                     half_inference=args.half_inference, \
                                                                         cfg_phi=args.cfg_phi, grad_scale=args.grad_scale)
             ## weighting
-            grad_ *= loss_weights[int(t)]
+            grad_ *= loss_weights[int(t)] # loss_weights = 全1
             # ref: https://github.com/threestudio-project/threestudio/blob/5e29759db7762ec86f503f97fe1f71a9153ce5d9/threestudio/models/guidance/stable_diffusion_guidance.py#L427
             # construct loss
             # loss = loss_weights[int(t)] * F.mse_loss(noise_pred, noise, reduction="mean") / args.batch_size
             target = (latents_vsd - grad_).detach()
             # d(loss)/d(latents) = latents - target = latents - (latents - grad) = grad
-            loss = 0.5 * F.mse_loss(latents_vsd, target, reduction="mean") / args.batch_size
+            # loss = 0.5 * F.mse_loss(latents_vsd, target, reduction="mean") / args.batch_size
+            loss = 0
+            mse_loss = torch.zeros(1)
+            ssim_loss = torch.zeros(1)
+            
+            sdsloss = 0.5 * F.mse_loss(latents_vsd, target, reduction="mean") / args.batch_size
+
+            if args.use_mseloss:
+                loss += (1 - args.mseloss_weight) * sdsloss
+                mse_loss = F.mse_loss(images[0], original_weight_images, reduction="mean") / args.batch_size
+                loss += args.mseloss_weight * mse_loss
+            if args.use_ssimloss:
+                loss += (1 - args.ssimloss_weight) * sdsloss
+                from pytorch_msssim import ssim, ms_ssim
+                ssim_loss = ssim(images[0], original_weight_images, data_range=1, size_average=False)[0]
+                loss += args.ssimloss_weight * (1 - ssim_loss) / args.batch_size
+            if args.use_mseloss==False and args.use_ssimloss==False:
+                loss = sdsloss
+                
+            if args.calculate_vae_encoder_gap:
+                target_deocer_img = batch_decode_vae(target, vae)
+                image_2 = batch_decode_vae(images[0], vae)
+                
+                if step == 0 or step == (args.num_steps-1):
+                    save_image((image_2).clamp(0, 1), f'{args.work_dir}/calculate_vae_image_step{step}_image_2_{image_name}.png')
+                    save_image((target_deocer_img).clamp(0, 1), f'{args.work_dir}/calculate_vae_image_step{step}_{image_name}.png')
+                    save_image((gt_img).clamp(0, 1), f'{args.work_dir}/gt_img_step{step}_{image_name}.png')
+                
+                vae_encoder_gap_loss = F.mse_loss(image_2, gt_img, reduction="mean") / args.batch_size
+                loss += vae_encoder_gap_loss
+                
+            # 更新loss记录
+            if lossTracker is not None:
+                lossTracker.append_loss(sds_loss = sdsloss, totalloss=loss, pred = image_2, mse_loss_=mse_loss, ssim_loss_=ssim_loss, vae_encoder_gap_loss=vae_encoder_gap_loss)
+            
             loss.backward()
             optimizer.step()
             if args.use_scheduler:
@@ -488,14 +544,32 @@ def main():
                             if args.half_inference:
                                 pred_latents_phi = pred_latents_phi.half()
                             image_x0_phi = vae_phi.decode(pred_latents_phi / vae.config.scaling_factor).sample.to(torch.float32)
-                            image = torch.cat((image_,image_x0,image_x0_phi), dim=2)
+                            if args.rgb_as_latents:
+                                images = []
+                                this_epoch_init_image = get_images(particles, vae, args.rgb_as_latents, use_mlp_particle=args.use_mlp_particle)
+                                images.append(this_epoch_init_image)
+                            image = torch.cat((images[0], image_,image_x0,image_x0_phi), dim=2)
+                            
                         else:
-                            image = torch.cat((image_,image_x0), dim=2)
+                            image = torch.cat((image_,image_x0), dim=2) # 原图和去噪后的latent图
                     else:
                         image = image_
+                        
+                # from torchvision.utils import save_image
+                # save_image(image, f'debug/image.png')        
+                # save_image(image_, f'debug/image_.png')        
+                # save_image(image_x0, f'debug/image_x0.png')        
+                
                 if args.log_progress:
+                    # image_progress.append((image).clamp(0, 1))
                     image_progress.append((image/2+0.5).clamp(0, 1))
+                    image_2_progress.append((images[0]).clamp(0, 1))
+                # if args.init_img_path:
+                #     save_image((image/2+0.5).clamp(0, 1), f'{args.work_dir}/{image_name}_image_step{step}_t{t.item()}.png')
+                # else:
                 save_image((image/2+0.5).clamp(0, 1), f'{args.work_dir}/{image_name}_image_step{step}_t{t.item()}.png')
+                save_image((images[0]).clamp(0, 1), f'{args.work_dir}/image_2_{image_name}.png')
+                # save_image((image/2+0.5).clamp(0, 1), f'{args.work_dir}/{image_name}_image_step{step}_t{t.item()}.png')
                 ave_train_loss_value = np.average(train_loss_values)
                 ave_train_loss_values.append(ave_train_loss_value) if step > 0 else None
                 logger.info(f'step: {step}; average loss: {ave_train_loss_value}')
@@ -524,11 +598,17 @@ def main():
         image = image_
     else:
         image = get_images(particles, vae, args.rgb_as_latents, use_mlp_particle=args.use_mlp_particle)
-    save_image((image/2+0.5).clamp(0, 1), f'{args.work_dir}/final_image_{image_name}.png')
+    save_image((image).clamp(0, 1), f'{args.work_dir}/final_image_{image_name}.png')
+    save_image((image/2+0.5).clamp(0, 1), f'{args.work_dir}/final_image_2_{image_name}.png')
+    if pre_image is not None:
+        save_image((pre_image/2+0.5).clamp(0, 1), f'{args.work_dir}/final_pre_image_{image_name}.png')
     # through vae will get image with less artifacts for image particles
     # from model_utils import batch_decode_vae
     # images = batch_decode_vae(latents, vae)
     # save_image((images/2+0.5).clamp(0, 1), f'{args.work_dir}/final_image_2_{image_name}.png')
+    
+    if lossTracker is not None:
+        lossTracker.save_loss(save_path = f'{args.work_dir}/loss_figs')
 
     if args.generation_mode in ['vsd'] and args.save_phi_model:
         if args.phi_model in ['lora']:

@@ -1,0 +1,30 @@
+num_steps 500
+log_steps 50
+lr 0.03
+phi_lr 0.0001 
+use_t_phi true
+model_path runwayml/stable-diffusion-v1-5
+loss_weight 1m_alphas_cumprod
+t_schedule random 
+generation_mode vsd
+phi_model lora
+lora_scale 1.
+prompt a photograph of an astronaut riding a horse
+height 512 
+width 512 
+batch size 1 
+guidance_scale 7.5
+log_progress true 
+save_x0 true 
+save_phi_model true 
+work_dir work_dir/1125/sd2.1/vsd/image/latent/cal_mse/
+use_mlp_particle false
+rgb_as_latents true
+#load_weight_path weight_prepare/astronaut_512.png/best_model_15.pt
+gt_img_path weight_prepare/astronaut_512.png/gt_astronaut.png
+#use_mseloss true
+#mseloss_weight 0.01
+#use_ssimloss true
+#ssimloss_weight 0.01
+init_img_path work_dir/1121/sd2.1/vsd/*default-20241121_1650-vsd-lr_0.03-cfg_7.5-bs_1-num_steps_1000-tschedule_random-loss_weight_none_lora/final_image_2_a_photograph_of_an_astronaut_riding_a_horse.png
+calculate_vae_encoder_gap true
